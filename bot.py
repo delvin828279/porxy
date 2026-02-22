@@ -92,15 +92,16 @@ def get_location(host):
     return result
 
 
-def ping_label(ms):
+def ping_label(ms, from_iran=False):
+    flag = "🇮🇷 " if from_iran else ""
     if ms is None:
         return "❌ N/A"
-    elif ms < 50:
-        return f"🟢 {ms}ms"
-    elif ms < 150:
-        return f"🟡 {ms}ms"
+    elif ms < 80:
+        return f"{flag}🟢 {ms}ms"
+    elif ms < 200:
+        return f"{flag}🟡 {ms}ms"
     else:
-        return f"🔴 {ms}ms"
+        return f"{flag}🔴 {ms}ms"
 
 
 def parse_proxy_link(line):
@@ -179,13 +180,68 @@ def get_from_text_files():
     return all_proxies
 
 
+# نودهای ایران در check-host.net
+IRAN_NODES = [
+    "ir1.node.check-host.net",  # تهران
+    "ir4.node.check-host.net",  # تبریز
+    "ir3.node.check-host.net",  # شیراز
+    "ir6.node.check-host.net",  # کرج
+]
+
+_checkhost_headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+
+def get_iran_ping(host, port):
+    """پینگ از ایران با check-host.net API"""
+    try:
+        nodes = random.sample(IRAN_NODES, 2)
+        node_params = "&".join([f"node={n}" for n in nodes])
+        url = f"https://check-host.net/check-tcp?host={host}:{port}&max_nodes=2&{node_params}"
+        r = requests.get(url, headers=_checkhost_headers, timeout=10)
+        request_id = r.json().get("request_id")
+        if not request_id:
+            return None
+
+        time.sleep(3)  # صبر برای انجام چک
+
+        result = requests.get(
+            f"https://check-host.net/check-result/{request_id}",
+            headers=_checkhost_headers, timeout=10
+        ).json()
+
+        pings = []
+        for node_result in result.values():
+            if not node_result:
+                continue
+            if isinstance(node_result, list):
+                for item in node_result:
+                    if isinstance(item, dict) and "time" in item:
+                        pings.append(int(item["time"] * 1000))
+                    elif isinstance(item, list) and item:
+                        for sub in item:
+                            if isinstance(sub, (int, float)):
+                                pings.append(int(sub * 1000))
+                                break
+
+        return min(pings) if pings else None
+    except Exception:
+        return None
+
+
 def check_and_ping(proxy):
+    """چک اتصال + پینگ از ایران"""
     try:
         host, port = proxy['host'], int(proxy['port'])
+
+        # چک سریع اتصال
         start = time.time()
-        with socket.create_connection((host, port), timeout=2):
-            proxy['ping'] = int((time.time() - start) * 1000)
-            return proxy
+        with socket.create_connection((host, port), timeout=3):
+            local_ping = int((time.time() - start) * 1000)
+
+        # پینگ از ایران
+        iran_ping = get_iran_ping(host, port)
+        proxy['ping'] = iran_ping if iran_ping is not None else local_ping
+        proxy['from_iran'] = iran_ping is not None
+        return proxy
     except Exception:
         return None
 
@@ -254,21 +310,24 @@ def create_banner(proxies):
 
     y = 76
     for i, p in enumerate(proxies):
-        ping    = p.get('ping')
-        flag    = p.get('flag', '🌍')
-        country = p.get('country', 'Unknown')
-        city    = p.get('city', '')
-        host    = p.get('host', '')
-        port    = p.get('port', '')
+        ping      = p.get('ping')
+        from_iran = p.get('from_iran', False)
+        flag      = p.get('flag', '🌍')
+        country   = p.get('country', 'Unknown')
+        city      = p.get('city', '')
+        host      = p.get('host', '')
+        port      = p.get('port', '')
 
         if ping is None:
-            pc, pt = (180, 60, 60),   "N/A"
-        elif ping < 50:
-            pc, pt = (60, 210, 100),  f"{ping} ms"
-        elif ping < 150:
-            pc, pt = (210, 190, 60),  f"{ping} ms"
+            pc, pt = (180, 60, 60),  "N/A"
+        elif ping < 80:
+            pc, pt = (60, 210, 100), f"{ping} ms"
+        elif ping < 200:
+            pc, pt = (210, 190, 60), f"{ping} ms"
         else:
-            pc, pt = (210, 100, 60),  f"{ping} ms"
+            pc, pt = (210, 100, 60), f"{ping} ms"
+
+        iran_label = " 🇮🇷" if from_iran else ""
 
         draw.rounded_rectangle([12, y, W - 12, y + 82], radius=12, fill=(22, 22, 42))
         draw.text((36, y + 14), f"#{i+1}", fill=(80, 130, 240))
@@ -278,8 +337,10 @@ def create_banner(proxies):
         draw.text((68, y + 40), f"  {host}:{port}", fill=(140, 200, 150))
 
         # ping badge
-        draw.rounded_rectangle([W - 130, y + 20, W - 25, y + 60], radius=8, fill=(30, 30, 55))
-        draw.text(((W - 130 + W - 25) // 2, y + 40), pt, fill=pc, anchor="mm")
+        draw.rounded_rectangle([W - 145, y + 20, W - 25, y + 60], radius=8, fill=(30, 30, 55))
+        draw.text(((W - 145 + W - 25) // 2, y + 33), pt + iran_label, fill=pc, anchor="mm")
+        if from_iran:
+            draw.text(((W - 145 + W - 25) // 2, y + 52), "از ایران", fill=(150, 150, 200), anchor="mm")
 
         y += 92
 
@@ -302,16 +363,17 @@ def create_banner(proxies):
 def format_caption(proxies):
     lines = ["🔐 *پروکسی‌های تلگرام \\- فعال و تست شده*", "━━━━━━━━━━━━━━━━━━━━\n"]
     for i, p in enumerate(proxies, 1):
-        flag    = p.get('flag', '🌍')
-        country = escape_md(p.get('country', 'Unknown'))
-        city    = escape_md(p.get('city', ''))
-        isp     = escape_md(p.get('isp', ''))
-        host    = p.get('host', '')
-        port    = p.get('port', '')
-        link    = p.get('link', '')
-        loc     = f"{city}, {country}" if city else country
+        flag       = p.get('flag', '🌍')
+        country    = escape_md(p.get('country', 'Unknown'))
+        city       = escape_md(p.get('city', ''))
+        isp        = escape_md(p.get('isp', ''))
+        host       = p.get('host', '')
+        port       = p.get('port', '')
+        link       = p.get('link', '')
+        from_iran  = p.get('from_iran', False)
+        loc        = f"{city}, {country}" if city else country
         lines.append(f"*{i}\\. {flag} {loc}*")
-        lines.append(f"⚡ {escape_md(ping_label(p.get('ping')))}")
+        lines.append(f"⚡ {escape_md(ping_label(p.get('ping'), from_iran))}")
         lines.append(f"🖥 `{host}:{port}`")
         if isp:
             lines.append(f"🏢 {isp}")
@@ -463,7 +525,11 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🏆 بهترین ping: `{_stats['best_ping']}ms`\n"
         f"⏳ آپتایم: `{h}` ساعت"
     )
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
+    # هم از پیام مستقیم هم از دکمه کار می‌کنه
+    if update.callback_query:
+        await update.callback_query.message.reply_text(text, parse_mode="MarkdownV2")
+    elif update.message:
+        await update.message.reply_text(text, parse_mode="MarkdownV2")
 
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
