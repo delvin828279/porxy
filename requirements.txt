@@ -3,3 +3,5 @@ beautifulsoup4
 python-telegram-bot==20.7
 schedule
 lxml
+playwright
+schedule
