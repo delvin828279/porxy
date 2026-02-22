@@ -1,93 +1,76 @@
-import requests
-from bs4 import BeautifulSoup
 import asyncio
-from telegram import Bot
+import os
 import schedule
 import time
-import os
+from playwright.async_api import async_playwright
+from telegram import Bot
 import re
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
-PROXY_URL = "https://proxybolt.link/"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-}
-
-def get_proxies():
+async def get_proxies_playwright():
+    proxies = []
     try:
-        session = requests.Session()
-        response = session.get(PROXY_URL, headers=HEADERS, timeout=20)
-        response.raise_for_status()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"]
+            )
+            page = await browser.new_page()
 
-        print(f"📄 Status: {response.status_code}")
-        print(f"📄 محتوا (500 کاراکتر اول):\n{response.text[:500]}\n")
+            print("🌐 در حال باز کردن سایت...")
+            await page.goto("https://proxybolt.link/", timeout=30000)
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        proxies = []
+            # صبر کن تا JavaScript لود بشه
+            await page.wait_for_timeout(5000)
 
-        # روش ۱: جدول
-        table = soup.find("table")
-        if table:
-            rows = table.find_all("tr")[1:]
-            print(f"✅ جدول پیدا شد - {len(rows)} ردیف")
-            for row in rows[:5]:
-                cols = row.find_all("td")
+            content = await page.content()
+            print(f"📄 سایز محتوا: {len(content)} کاراکتر")
+
+            # روش ۱: جدول
+            rows = await page.query_selector_all("table tr")
+            print(f"🔍 تعداد ردیف جدول: {len(rows)}")
+
+            for row in rows[1:6]:  # skip header, max 5
+                cols = await row.query_selector_all("td")
                 if len(cols) >= 2:
-                    ip = cols[0].get_text(strip=True)
-                    port = cols[1].get_text(strip=True)
-                    ptype = cols[2].get_text(strip=True) if len(cols) > 2 else "HTTP"
-                    country = cols[3].get_text(strip=True) if len(cols) > 3 else "🌍"
+                    ip = await cols[0].inner_text()
+                    port = await cols[1].inner_text()
+                    ptype = await cols[2].inner_text() if len(cols) > 2 else "HTTP"
+                    country = await cols[3].inner_text() if len(cols) > 3 else "🌍"
+                    ip = ip.strip()
+                    port = port.strip()
                     if re.match(r'\d+\.\d+\.\d+\.\d+', ip):
-                        proxies.append({"ip": ip, "port": port, "type": ptype, "country": country})
+                        proxies.append({
+                            "ip": ip,
+                            "port": port,
+                            "type": ptype.strip(),
+                            "country": country.strip()
+                        })
 
-        # روش ۲: متن آزاد با regex
-        if not proxies:
-            print("🔍 جستجو با Regex...")
-            pattern = re.findall(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{2,5})', response.text)
-            for ip, port in pattern[:5]:
-                proxies.append({"ip": ip, "port": port, "type": "HTTP", "country": "🌍"})
-            print(f"✅ Regex: {len(proxies)} پروکسی")
+            # روش ۲: Regex روی محتوای کامل
+            if not proxies:
+                print("🔍 جستجو با Regex در محتوای کامل...")
+                found = re.findall(
+                    r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[:\s]+(\d{2,5})',
+                    content
+                )
+                for ip, port in found[:5]:
+                    proxies.append({
+                        "ip": ip,
+                        "port": port,
+                        "type": "HTTP",
+                        "country": "🌍"
+                    })
 
-        # روش ۳: pre یا code tag
-        if not proxies:
-            for tag in soup.find_all(["pre", "code", "textarea", "p"]):
-                text = tag.get_text()
-                found = re.findall(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{2,5})', text)
-                for ip, port in found:
-                    proxies.append({"ip": ip, "port": port, "type": "HTTP", "country": "🌍"})
-                if proxies:
-                    break
-
-        print(f"📊 نتیجه: {len(proxies)} پروکسی پیدا شد")
-        return proxies
+            await browser.close()
+            print(f"✅ {len(proxies)} پروکسی پیدا شد")
 
     except Exception as e:
-        print(f"❌ خطا: {e}")
-        return []
+        print(f"❌ خطا در Playwright: {e}")
 
-
-def format_message(proxies):
-    if not proxies:
-        return None
-
-    lines = ["🌐 *پروکسی‌های رایگان*", "━━━━━━━━━━━━━━━━━━\n"]
-    for p in proxies:
-        lines.append(f"🔹 `{p['ip']}:{p['port']}`")
-        lines.append(f"   📡 `{p['type']}` | {p['country']}\n")
-
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("⏱ بروزرسانی هر ۵ دقیقه")
-    lines.append("🔗 [ProxyBolt](https://proxybolt.link/)")
-
-    return "\n".join(lines)
+    return proxies
 
 
 async def send_to_channel(message):
@@ -104,27 +87,43 @@ async def send_to_channel(message):
         print(f"❌ خطا در ارسال: {e}")
 
 
-def job():
+def format_message(proxies):
+    lines = ["🌐 *پروکسی‌های رایگان*", "━━━━━━━━━━━━━━━━━━\n"]
+    for p in proxies:
+        lines.append(f"🔹 `{p['ip']}:{p['port']}`")
+        lines.append(f"   📡 `{p['type']}` | {p['country']}\n")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("⏱ بروزرسانی هر ۵ دقیقه")
+    lines.append("🔗 [ProxyBolt](https://proxybolt.link/)")
+    return "\n".join(lines)
+
+
+async def job():
     print("\n" + "="*40)
     print("🔄 شروع دریافت پروکسی...")
-    proxies = get_proxies()
-
+    proxies = await get_proxies_playwright()
     if proxies:
         msg = format_message(proxies)
-        asyncio.run(send_to_channel(msg))
+        await send_to_channel(msg)
     else:
-        print("⚠️ هیچ پروکسی پیدا نشد - ساختار سایت رو بررسی کن")
+        print("⚠️ پروکسی پیدا نشد!")
 
 
-def main():
+async def main():
     print("🚀 ربات شروع به کار کرد!")
-    job()  # اجرای فوری
 
-    schedule.every(5).minutes.do(job)
+    # نصب مرورگر
+    import subprocess
+    subprocess.run(["playwright", "install", "chromium"], check=True)
+    subprocess.run(["playwright", "install-deps", "chromium"], check=True)
+
+    await job()  # اجرای فوری
+
     while True:
+        schedule.every(5).minutes.do(lambda: asyncio.create_task(job()))
         schedule.run_pending()
-        time.sleep(10)
+        await asyncio.sleep(10)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
