@@ -7,37 +7,25 @@ import os
 import asyncio
 import schedule
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse, parse_qs, unquote
-from telegram import Bot
+from urllib.parse import urlparse, parse_qs
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
+import io
 
 # ─── تنظیمات ───────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
+SEND_INTERVAL_MINUTES = 5
 
 PROXY_SOURCES = {
     'proxybolt': 'https://proxybolt.link/',
     'text_files': [
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no1.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no2.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no3.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no4.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no5.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no6.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no7.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no8.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no9.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no10.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no11.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no12.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no13.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no14.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no15.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no16.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no17.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no18.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no19.txt",
-        "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no20.txt",
+        f"https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/TELEGRAM_PROXY_SUB/refs/heads/main/telegram_proxy_no{i}.txt"
+        for i in range(1, 21)
     ]
 }
 
@@ -59,296 +47,504 @@ COUNTRY_FLAGS = {
     "Lithuania": "🇱🇹", "Estonia": "🇪🇪", "Moldova": "🇲🇩",
     "Luxembourg": "🇱🇺", "Belgium": "🇧🇪", "Italy": "🇮🇹",
     "Spain": "🇪🇸", "Portugal": "🇵🇹", "Norway": "🇳🇴",
-    "Denmark": "🇩🇰", "Iceland": "🇮🇸", "Israel": "🇮🇱",
-    "UAE": "🇦🇪", "Saudi Arabia": "🇸🇦", "Mexico": "🇲🇽",
-    "Argentina": "🇦🇷", "Chile": "🇨🇱", "Colombia": "🇨🇴",
+    "Denmark": "🇩🇰", "Israel": "🇮🇱", "UAE": "🇦🇪",
+    "Saudi Arabia": "🇸🇦", "Mexico": "🇲🇽",
 }
 
-_geo_cache = {}
+_geo_cache    = {}
+_last_proxies = []
+_stats = {
+    "total_checked": 0,
+    "total_active":  0,
+    "best_ping":     9999,
+    "best_country":  "",
+    "send_count":    0,
+    "start_time":    datetime.now(),
+}
 
 
-# ─── پیدا کردن لوکیشن IP ───────────────────────────────
+# ══════════════════════════════════════════════════════════
+#  ابزارها
+# ══════════════════════════════════════════════════════════
+
 def get_location(host):
-    # اگر hostname باشه نه IP، برگردون unknown
-    if not host.replace('.', '').isdigit():
+    if not host:
         return {"country": "Unknown", "city": "", "isp": "", "flag": "🌍"}
-
     if host in _geo_cache:
         return _geo_cache[host]
-
     try:
-        response = requests.get(
-            f"http://ip-api.com/json/{host}?fields=country,city,isp",
-            timeout=5
-        )
-        data = response.json()
-        if data.get('country'):
-            country = data.get('country', 'Unknown')
-            city = data.get('city', '')
-            isp = data.get('isp', '')
-            flag = COUNTRY_FLAGS.get(country, '🌍')
-            result = {"country": country, "city": city, "isp": isp, "flag": flag}
+        r = requests.get(f"http://ip-api.com/json/{host}?fields=country,city,isp", timeout=5)
+        d = r.json()
+        if d.get('country'):
+            country = d['country']
+            result = {
+                "country": country,
+                "city":    d.get('city', ''),
+                "isp":     d.get('isp', ''),
+                "flag":    COUNTRY_FLAGS.get(country, '🌍')
+            }
             _geo_cache[host] = result
             return result
     except Exception:
         pass
-
     result = {"country": "Unknown", "city": "", "isp": "", "flag": "🌍"}
     _geo_cache[host] = result
     return result
 
 
-# ─── پارس کردن لینک پروکسی (هر دو فرمت) ───────────────
-def parse_proxy_link(line):
-    """
-    پشتیبانی از هر دو فرمت:
-    - https://t.me/proxy?server=...&port=...&secret=...
-    - tg://proxy?server=...&port=...&secret=...
-    """
-    line = line.strip()
+def ping_label(ms):
+    if ms is None:
+        return "❌ N/A"
+    elif ms < 50:
+        return f"🟢 {ms}ms"
+    elif ms < 150:
+        return f"🟡 {ms}ms"
+    else:
+        return f"🔴 {ms}ms"
 
+
+def parse_proxy_link(line):
+    line = line.strip()
     if not line:
         return None
-
-    # تبدیل t.me به tg://
-    if line.startswith("https://t.me/proxy") or line.startswith("http://t.me/proxy"):
+    if "t.me/proxy" in line:
         tg_link = line.replace("https://t.me/proxy", "tg://proxy", 1)
         tg_link = tg_link.replace("http://t.me/proxy", "tg://proxy", 1)
     elif line.startswith("tg://proxy"):
         tg_link = line
     else:
         return None
-
     try:
         parsed = urlparse(tg_link)
         params = parse_qs(parsed.query)
-        host = params.get('server', [''])[0]
-        port = params.get('port', [''])[0]
+        host   = params.get('server', [''])[0]
+        port   = params.get('port', [''])[0]
         secret = params.get('secret', [''])[0]
-
         if not host or not port:
             return None
-
-        return {
-            "link": tg_link,
-            "host": host,
-            "port": port,
-            "secret": secret,
-            "name": "",
-            "country": "",
-            "city": "",
-            "isp": "",
-            "flag": "🌍",
-        }
+        return {"link": tg_link, "host": host, "port": port, "secret": secret,
+                "name": "", "country": "", "city": "", "isp": "", "flag": "🌍", "ping": None}
     except Exception:
         return None
 
 
-# ─── دریافت از ProxyBolt ────────────────────────────────
+def escape_md(text):
+    text = str(text)
+    for ch in ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']:
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
+
+# ══════════════════════════════════════════════════════════
+#  دریافت پروکسی
+# ══════════════════════════════════════════════════════════
+
 def get_from_proxybolt():
     try:
-        response = requests.get(
-            PROXY_SOURCES['proxybolt'],
-            headers=HEADERS,
-            timeout=15
-        )
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-
+        r = requests.get(PROXY_SOURCES['proxybolt'], headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.content, 'html.parser')
         app_div = soup.find('div', id='app')
         if not app_div or 'data-page' not in app_div.attrs:
-            print("❌ div#app یا data-page پیدا نشد")
             return []
-
-        page_data = json.loads(app_div['data-page'])
-        proxies_data = page_data.get('props', {}).get('proxies', [])
-        print(f"✅ ProxyBolt: {len(proxies_data)} پروکسی پیدا شد")
-
+        page_data   = json.loads(app_div['data-page'])
+        proxies_raw = page_data.get('props', {}).get('proxies', [])
+        print(f"✅ ProxyBolt: {len(proxies_raw)} پروکسی")
         result = []
-        for p in proxies_data:
+        for p in proxies_raw:
             if p.get('host'):
-                link = f"tg://proxy?server={p.get('host')}&port={p.get('port')}&secret={p.get('secret')}"
-                result.append({
-                    "link": link,
-                    "host": p.get('host'),
-                    "port": str(p.get('port', '')),
-                    "secret": p.get('secret', ''),
-                    "name": p.get('name', ''),
-                    "country": "",
-                    "city": "",
-                    "isp": "",
-                    "flag": "🌍",
-                })
+                link = f"tg://proxy?server={p['host']}&port={p['port']}&secret={p.get('secret','')}"
+                result.append({"link": link, "host": p['host'], "port": str(p['port']),
+                                "secret": p.get('secret', ''), "name": p.get('name', ''),
+                                "country": "", "city": "", "isp": "", "flag": "🌍", "ping": None})
         return result
-
     except Exception as e:
-        print(f"❌ خطا ProxyBolt: {e}")
+        print(f"❌ ProxyBolt: {e}")
         return []
 
 
-# ─── دریافت از فایل‌های متنی GitHub ────────────────────
 def get_from_text_files():
     all_proxies = []
     for url in PROXY_SOURCES['text_files']:
         try:
-            response = requests.get(url, headers=HEADERS, timeout=8)
-            response.raise_for_status()
-            lines = response.text.strip().split('\n')
-            count = 0
-            for line in lines:
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            r.raise_for_status()
+            for line in r.text.strip().split('\n'):
                 proxy = parse_proxy_link(line)
                 if proxy:
                     all_proxies.append(proxy)
-                    count += 1
-            if count > 0:
-                file_num = url.split('no')[-1].replace('.txt', '')
-                print(f"  📄 فایل {file_num}: {count} پروکسی")
-        except Exception as e:
-            print(f"  ⚠️ خطا در فایل: {e}")
+        except Exception:
             continue
-
     print(f"✅ فایل‌های متنی: {len(all_proxies)} پروکسی")
     return all_proxies
 
 
-# ─── چک کردن اتصال ─────────────────────────────────────
-def check_proxy(proxy):
+def check_and_ping(proxy):
     try:
-        host = proxy['host']
-        port = int(proxy['port'])
+        host, port = proxy['host'], int(proxy['port'])
+        start = time.time()
         with socket.create_connection((host, port), timeout=2):
+            proxy['ping'] = int((time.time() - start) * 1000)
             return proxy
     except Exception:
         return None
 
 
-# ─── دریافت لوکیشن ─────────────────────────────────────
-def enrich_with_location(proxies):
-    print(f"🗺 در حال دریافت لوکیشن {len(proxies)} پروکسی...")
-    for p in proxies:
-        geo = get_location(p['host'])
-        p['country'] = geo['country']
-        p['city'] = geo['city']
-        p['isp'] = geo['isp']
-        p['flag'] = geo['flag']
-        time.sleep(0.2)
-    return proxies
+def get_active_proxies(max_check=100, return_count=5, country_filter=None):
+    global _stats, _last_proxies
 
+    all_p = get_from_proxybolt() + get_from_text_files()
 
-# ─── دریافت + فیلتر پروکسی‌های فعال ───────────────────
-def get_active_proxies(max_check=80, return_count=5):
-    bolt = get_from_proxybolt()
-    files = get_from_text_files()
-    all_proxies = bolt + files
-
-    # حذف تکراری
-    seen = set()
-    unique = []
-    for p in all_proxies:
+    seen, unique = set(), []
+    for p in all_p:
         key = f"{p['host']}:{p['port']}"
         if key not in seen:
             seen.add(key)
             unique.append(p)
 
-    print(f"📊 کل منحصربفرد: {len(unique)}")
+    print(f"📊 کل: {len(unique)}")
+    _stats["total_checked"] += min(len(unique), max_check)
 
-    to_check = unique[:max_check]
-    print(f"🔍 در حال چک اتصال {len(to_check)} پروکسی...")
-
-    with ThreadPoolExecutor(max_workers=40) as executor:
-        results = list(executor.map(check_proxy, to_check))
+    with ThreadPoolExecutor(max_workers=40) as ex:
+        results = list(ex.map(check_and_ping, unique[:max_check]))
     active = [r for r in results if r is not None]
+    active.sort(key=lambda x: x.get('ping') or 9999)
 
-    print(f"✅ فعال: {len(active)} پروکسی")
+    print(f"✅ فعال: {len(active)}")
+    _stats["total_active"] += len(active)
 
-    random.shuffle(active)
-    active = active[:return_count]
+    if active and active[0].get('ping', 9999) < _stats["best_ping"]:
+        _stats["best_ping"] = active[0]['ping']
 
-    active = enrich_with_location(active)
-    return active
+    # اضافه کردن لوکیشن و فیلتر
+    final = []
+    for p in active:
+        if len(final) >= return_count:
+            break
+        geo = get_location(p['host'])
+        p.update(geo)
+        time.sleep(0.1)
+        if country_filter:
+            if country_filter.lower() not in geo['country'].lower():
+                continue
+        final.append(p)
+
+    if final:
+        _stats["best_country"] = final[0].get('flag', '') + ' ' + final[0].get('country', '')
+
+    _last_proxies = final
+    return final
 
 
-# ─── فرمت پیام ─────────────────────────────────────────
-def escape_md(text):
-    """Escape کردن کاراکترهای خاص MarkdownV2"""
-    special = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    for ch in special:
-        text = text.replace(ch, f'\\{ch}')
-    return text
+# ══════════════════════════════════════════════════════════
+#  بنر گرافیکی
+# ══════════════════════════════════════════════════════════
+
+def create_banner(proxies):
+    W = 800
+    H = 90 + len(proxies) * 95 + 40
+    img  = Image.new('RGB', (W, H), color=(15, 15, 28))
+    draw = ImageDraw.Draw(img)
+
+    # هدر
+    draw.rectangle([0, 0, W, 65], fill=(25, 25, 55))
+    draw.text((W // 2, 22), "🔐  Telegram Proxy List", fill=(130, 180, 255), anchor="mm")
+    draw.text((W // 2, 50), datetime.now().strftime("%Y-%m-%d   %H:%M  UTC"), fill=(100, 100, 160), anchor="mm")
+    draw.line([(0, 66), (W, 66)], fill=(50, 50, 100), width=2)
+
+    y = 76
+    for i, p in enumerate(proxies):
+        ping    = p.get('ping')
+        flag    = p.get('flag', '🌍')
+        country = p.get('country', 'Unknown')
+        city    = p.get('city', '')
+        host    = p.get('host', '')
+        port    = p.get('port', '')
+
+        if ping is None:
+            pc, pt = (180, 60, 60),   "N/A"
+        elif ping < 50:
+            pc, pt = (60, 210, 100),  f"{ping} ms"
+        elif ping < 150:
+            pc, pt = (210, 190, 60),  f"{ping} ms"
+        else:
+            pc, pt = (210, 100, 60),  f"{ping} ms"
+
+        draw.rounded_rectangle([12, y, W - 12, y + 82], radius=12, fill=(22, 22, 42))
+        draw.text((36, y + 14), f"#{i+1}", fill=(80, 130, 240))
+
+        loc = f"{flag}  {city + ', ' if city else ''}{country}"
+        draw.text((68, y + 11), loc, fill=(220, 220, 255))
+        draw.text((68, y + 40), f"  {host}:{port}", fill=(140, 200, 150))
+
+        # ping badge
+        draw.rounded_rectangle([W - 130, y + 20, W - 25, y + 60], radius=8, fill=(30, 30, 55))
+        draw.text(((W - 130 + W - 25) // 2, y + 40), pt, fill=pc, anchor="mm")
+
+        y += 92
+
+    # فوتر
+    draw.rectangle([0, H - 35, W, H], fill=(20, 20, 45))
+    draw.text((W // 2, H - 17),
+              f"Auto update every {SEND_INTERVAL_MINUTES} min  •  Sorted by speed",
+              fill=(80, 80, 130), anchor="mm")
+
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    return buf
 
 
-def format_message(proxies):
-    lines = [
-        "🔐 *پروکسی‌های تلگرام \\- فعال و تست شده*",
-        "━━━━━━━━━━━━━━━━━━━━\n"
-    ]
+# ══════════════════════════════════════════════════════════
+#  ارسال پست
+# ══════════════════════════════════════════════════════════
 
+def format_caption(proxies):
+    lines = ["🔐 *پروکسی‌های تلگرام \\- فعال و تست شده*", "━━━━━━━━━━━━━━━━━━━━\n"]
     for i, p in enumerate(proxies, 1):
-        flag = p.get('flag', '🌍')
+        flag    = p.get('flag', '🌍')
         country = escape_md(p.get('country', 'Unknown'))
-        city = escape_md(p.get('city', ''))
-        isp = escape_md(p.get('isp', ''))
-        host = escape_md(p.get('host', ''))
-        port = escape_md(str(p.get('port', '')))
-        link = p.get('link', '')
-
-        location_str = f"{city}, {country}" if city else country
-
-        lines.append(f"*{i}\\. {flag} {location_str}*")
-        lines.append(f"🖥 `{p.get('host')}:{p.get('port')}`")
+        city    = escape_md(p.get('city', ''))
+        isp     = escape_md(p.get('isp', ''))
+        host    = p.get('host', '')
+        port    = p.get('port', '')
+        link    = p.get('link', '')
+        loc     = f"{city}, {country}" if city else country
+        lines.append(f"*{i}\\. {flag} {loc}*")
+        lines.append(f"⚡ {escape_md(ping_label(p.get('ping')))}")
+        lines.append(f"🖥 `{host}:{port}`")
         if isp:
             lines.append(f"🏢 {isp}")
-        lines.append(f"[🔗 اتصال مستقیم به تلگرام]({link})\n")
-
+        lines.append(f"[🔗 اتصال مستقیم]({link})\n")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("⏱ بروزرسانی هر ۵ دقیقه")
-    lines.append("✅ همه پروکسی‌ها تست شده و فعال هستن")
-
+    lines.append(f"⏱ بروزرسانی هر {SEND_INTERVAL_MINUTES} دقیقه")
+    lines.append("✅ مرتب‌شده بر اساس سرعت")
     return "\n".join(lines)
 
 
-# ─── ارسال به کانال ─────────────────────────────────────
-async def send_to_channel(message):
+async def send_proxy_post(bot, proxies=None, country_filter=None, chat_id=None):
+    global _stats
+    target = chat_id or CHANNEL_ID
+    if proxies is None:
+        proxies = get_active_proxies(max_check=100, return_count=5, country_filter=country_filter)
+    if not proxies:
+        return
+    caption = format_caption(proxies)
     try:
-        bot = Bot(token=BOT_TOKEN)
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=message,
-            parse_mode="MarkdownV2",
-            disable_web_page_preview=True
-        )
-        print("✅ پیام ارسال شد!")
+        banner = create_banner(proxies)
+        await bot.send_photo(chat_id=target, photo=banner, caption=caption, parse_mode="MarkdownV2")
+    except Exception:
+        await bot.send_message(chat_id=target, text=caption, parse_mode="MarkdownV2",
+                               disable_web_page_preview=True)
+    _stats["send_count"] += 1
+    print(f"✅ پست #{_stats['send_count']} ارسال شد")
+
+
+# ══════════════════════════════════════════════════════════
+#  نوتیف قطعی
+# ══════════════════════════════════════════════════════════
+
+async def check_alive_and_notify(bot):
+    global _last_proxies
+    if not _last_proxies:
+        return
+    dead = [p for p in _last_proxies if check_and_ping(dict(p)) is None]
+    if dead:
+        lines = ["⚠️ *هشدار: پروکسی‌های زیر قطع شدند\\!*\n"]
+        for p in dead:
+            lines.append(f"❌ `{p['host']}:{p['port']}` {p.get('flag','')} {escape_md(p.get('country',''))}")
+        lines.append("\n🔄 پروکسی جدید در حال ارسال\\.\\.\\.")
+        try:
+            await bot.send_message(chat_id=CHANNEL_ID, text="\n".join(lines), parse_mode="MarkdownV2")
+        except Exception as e:
+            print(f"❌ نوتیف: {e}")
+
+
+# ══════════════════════════════════════════════════════════
+#  آمار روزانه
+# ══════════════════════════════════════════════════════════
+
+async def send_daily_stats(bot):
+    uptime = datetime.now() - _stats["start_time"]
+    h = int(uptime.total_seconds() // 3600)
+    lines = [
+        "📊 *آمار روزانه کانال*",
+        "━━━━━━━━━━━━━━━\n",
+        f"🔍 کل پروکسی چک‌شده: `{_stats['total_checked']}`",
+        f"✅ کل پروکسی فعال: `{_stats['total_active']}`",
+        f"📤 تعداد پست‌ها: `{_stats['send_count']}`",
+        f"🏆 بهترین ping: `{_stats['best_ping']}ms` {escape_md(_stats['best_country'])}",
+        f"⏳ آپتایم: `{h}` ساعت",
+        "\n━━━━━━━━━━━━━━━",
+        "💡 به ربات پیام بده و پروکسی بگیر\\!"
+    ]
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text="\n".join(lines), parse_mode="MarkdownV2")
     except Exception as e:
-        print(f"❌ خطا در ارسال: {e}")
+        print(f"❌ آمار: {e}")
 
 
-# ─── کار اصلی ───────────────────────────────────────────
-async def job():
-    print("\n" + "="*45)
-    print("🔄 شروع دریافت پروکسی...")
-    proxies = get_active_proxies(max_check=80, return_count=5)
+# ══════════════════════════════════════════════════════════
+#  کامندهای ربات
+# ══════════════════════════════════════════════════════════
+
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 ۵ پروکسی تصادفی",         callback_data="get_5")],
+        [InlineKeyboardButton("⚡ سریع‌ترین‌ها (زیر ۵۰ms)", callback_data="get_fast")],
+        [
+            InlineKeyboardButton("🇩🇪 آلمان",  callback_data="country_Germany"),
+            InlineKeyboardButton("🇳🇱 هلند",   callback_data="country_Netherlands"),
+            InlineKeyboardButton("🇺🇸 آمریکا", callback_data="country_United States"),
+        ],
+        [
+            InlineKeyboardButton("🇫🇮 فنلاند", callback_data="country_Finland"),
+            InlineKeyboardButton("🇫🇷 فرانسه", callback_data="country_France"),
+            InlineKeyboardButton("🇸🇪 سوئد",   callback_data="country_Sweden"),
+        ],
+        [InlineKeyboardButton("📊 آمار ربات", callback_data="stats")],
+    ])
+
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 *سلام\\! به ربات پروکسی خوش اومدی* 🎉\n\n"
+        "از دکمه‌های زیر پروکسی دلخواهت رو انتخاب کن:\n\n"
+        f"🔄 کانال هر `{SEND_INTERVAL_MINUTES}` دقیقه آپدیت میشه\n"
+        "⚡ پروکسی‌ها بر اساس سرعت مرتب‌ان\n"
+        "🌍 لوکیشن و ISP هر پروکسی نشون داده میشه"
+    )
+    await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=main_keyboard())
+
+
+async def cmd_proxy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⏳ در حال دریافت پروکسی\\.\\.\\.", parse_mode="MarkdownV2")
+    proxies = get_active_proxies(return_count=5)
+    await msg.delete()
+    await send_proxy_post(ctx.bot, proxies=proxies, chat_id=update.effective_chat.id)
+
+
+async def cmd_fast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⚡ جستجوی سریع‌ترین پروکسی‌ها\\.\\.\\.", parse_mode="MarkdownV2")
+    proxies = get_active_proxies(max_check=120, return_count=10)
+    fast = [p for p in proxies if p.get('ping') and p['ping'] < 50][:5] or proxies[:5]
+    await msg.delete()
+    await send_proxy_post(ctx.bot, proxies=fast, chat_id=update.effective_chat.id)
+
+
+async def cmd_country(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text(
+            "📌 مثال: `/country germany`\n`/country netherlands`\n`/country finland`",
+            parse_mode="MarkdownV2"
+        )
+        return
+    country = " ".join(ctx.args)
+    msg = await update.message.reply_text(
+        f"🌍 جستجوی پروکسی {escape_md(country)}\\.\\.\\.", parse_mode="MarkdownV2"
+    )
+    proxies = get_active_proxies(max_check=120, return_count=5, country_filter=country)
+    await msg.delete()
+    if proxies:
+        await send_proxy_post(ctx.bot, proxies=proxies, chat_id=update.effective_chat.id)
+    else:
+        await update.message.reply_text(
+            f"❌ پروکسی از {escape_md(country)} پیدا نشد\\.", parse_mode="MarkdownV2"
+        )
+
+
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    h = int((datetime.now() - _stats["start_time"]).total_seconds() // 3600)
+    text = (
+        "📊 *آمار ربات*\n━━━━━━━━━━━━━━━\n\n"
+        f"🔍 کل چک‌شده: `{_stats['total_checked']}`\n"
+        f"✅ کل فعال: `{_stats['total_active']}`\n"
+        f"📤 پست‌های ارسالی: `{_stats['send_count']}`\n"
+        f"🏆 بهترین ping: `{_stats['best_ping']}ms`\n"
+        f"⏳ آپتایم: `{h}` ساعت"
+    )
+    await update.message.reply_text(text, parse_mode="MarkdownV2")
+
+
+async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data  = query.data
+    cid   = query.message.chat_id
+
+    loading = await query.message.reply_text("⏳ لطفاً صبر کن\\.\\.\\.", parse_mode="MarkdownV2")
+
+    if data == "get_5":
+        proxies = get_active_proxies(return_count=5)
+    elif data == "get_fast":
+        all_p   = get_active_proxies(max_check=120, return_count=10)
+        proxies = [p for p in all_p if p.get('ping') and p['ping'] < 50][:5] or all_p[:5]
+    elif data.startswith("country_"):
+        country = data.replace("country_", "")
+        proxies = get_active_proxies(max_check=120, return_count=5, country_filter=country)
+    elif data == "stats":
+        await loading.delete()
+        await cmd_stats(update, ctx)
+        return
+    else:
+        proxies = []
+
+    await loading.delete()
 
     if proxies:
-        msg = format_message(proxies)
-        await send_to_channel(msg)
+        await send_proxy_post(ctx.bot, proxies=proxies, chat_id=cid)
     else:
-        print("⚠️ هیچ پروکسی فعالی پیدا نشد!")
+        await query.message.reply_text("❌ پروکسی پیدا نشد\\. دوباره امتحان کن\\.", parse_mode="MarkdownV2")
 
 
-async def main():
-    print("🚀 ربات پروکسی شروع به کار کرد!")
+# ══════════════════════════════════════════════════════════
+#  زمان‌بند
+# ══════════════════════════════════════════════════════════
 
-    await job()
+def run_schedule(bot_instance):
+    def sync_periodic():
+        async def _job():
+            await check_alive_and_notify(bot_instance)
+            await send_proxy_post(bot_instance)
+        asyncio.run(_job())
 
-    def run_job():
-        asyncio.create_task(job())
+    def sync_daily():
+        asyncio.run(send_daily_stats(bot_instance))
 
-    schedule.every(5).minutes.do(run_job)
+    schedule.every(SEND_INTERVAL_MINUTES).minutes.do(sync_periodic)
+    schedule.every().day.at("09:00").do(sync_daily)
 
+    print(f"⏰ زمان‌بند فعال: هر {SEND_INTERVAL_MINUTES} دقیقه")
     while True:
         schedule.run_pending()
-        await asyncio.sleep(10)
+        time.sleep(15)
+
+
+# ══════════════════════════════════════════════════════════
+#  main
+# ══════════════════════════════════════════════════════════
+
+def main():
+    print("🚀 ربات پروکسی شروع به کار کرد!")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("proxy",   cmd_proxy))
+    app.add_handler(CommandHandler("fast",    cmd_fast))
+    app.add_handler(CommandHandler("country", cmd_country))
+    app.add_handler(CommandHandler("stats",   cmd_stats))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    # زمان‌بند در thread جداگانه
+    bot_instance = Bot(token=BOT_TOKEN)
+    threading.Thread(target=run_schedule, args=(bot_instance,), daemon=True).start()
+
+    # پست اول
+    asyncio.get_event_loop().run_until_complete(send_proxy_post(bot_instance))
+
+    print("🤖 ربات در حال اجراست...")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
